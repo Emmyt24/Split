@@ -42,8 +42,6 @@ contract SplitContract is ReentrancyGuard {
     uint256 public tokenDistributed;
     bool public finalized;
 
-    event SwapRequested(address indexed recipient, uint256 amount, string toFiat);
-
     error invalid_caller();
     error split_NotFinalized();
     error no_Token_to_Distribute();
@@ -73,7 +71,7 @@ contract SplitContract is ReentrancyGuard {
         address _splitCreator,
         address _treasury,
         address _token
-    ) {
+    ){
         require(_recipients.length > 0, "Must have at least one recipient");
         require(
             _recipients.length == _percentages.length,
@@ -253,19 +251,6 @@ contract SplitContract is ReentrancyGuard {
         require(amount > 0, "Amount must be greater than zero");
         require(msg.value == amount, "Sent ETH must match the specified amount");
         emit ETHReceived(msg.sender, amount);
-    }
-
-    function swap(uint256 amount, string calldata toFiat) external {
-        require(token != address(0), "No token set for this split");
-        require(amount > 0, "Amount must be greater than zero");
-        require(bytes(toFiat).length > 0, "Fiat currency must be specified");
-        require(IERC20(token).balanceOf(msg.sender) >= amount, "Insufficient token balance");
-
-        // Transfer tokens from recipient to contract (or burn/hold for swap)
-        IERC20(token).safeTransferFrom(msg.sender, address(this), amount);
-
-        // Emit event for off-chain swap via Paycrest
-        emit SwapRequested(msg.sender, amount, toFiat);
     }
 }
 
