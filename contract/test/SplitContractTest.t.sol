@@ -39,8 +39,7 @@ contract SplitContractTest is Test {
             recipients,
             percentages,
             creator,
-            treasury,
-            address(token)
+            treasury
         );
     }
 
@@ -48,7 +47,6 @@ contract SplitContractTest is Test {
     function testConstructor() public {
         assertEq(split.splitCreator(), creator);
         assertEq(split.treasury(), treasury);
-        assertEq(split.token(), address(token));
         assertEq(split.recipients(0), recipient1);
         assertEq(split.recipients(1), recipient2);
         assertEq(split.percentages(0), 5000);
@@ -59,13 +57,12 @@ contract SplitContractTest is Test {
     function testConstructorInvalidRecipients() public {
         address[] memory emptyRecipients = new address[](0);
         uint256[] memory emptyPercentages = new uint256[](0);
-        vm.expectRevert("Must have at least one recipient");
+        vm.expectRevert(SplitContract.RecipientCountExceedsLimit.selector);
         new SplitContract(
             emptyRecipients,
             emptyPercentages,
             creator,
-            treasury,
-            address(0)
+            treasury
         );
     }
 
@@ -75,8 +72,8 @@ contract SplitContractTest is Test {
         uint256[] memory perc = new uint256[](2);
         perc[0] = 5000;
         perc[1] = 5000;
-        vm.expectRevert("Recipients and percentages length mismatch");
-        new SplitContract(rec, perc, creator, treasury, address(0));
+        vm.expectRevert(SplitContract.InvalidPercentageSum.selector);
+        new SplitContract(rec, perc, creator, treasury);
     }
 
     // Test receive function
@@ -88,19 +85,19 @@ contract SplitContractTest is Test {
     }
 
     function testReceiveETHZero() public {
-        vm.expectRevert("must send ETH");
+        vm.expectRevert(SplitContract.AmountMustBeGreaterThanZero.selector);
         address(split).call{value: 0}("");
     }
 
-    // Test distributeEth
-    function testDistributeEth() public {
+    // Test distributeNative
+    function testDistributeNative() public {
         vm.deal(address(split), 10000);
         uint256 initialTreasuryBalance = treasury.balance;
         uint256 initialRecipient1Balance = recipient1.balance;
         uint256 initialRecipient2Balance = recipient2.balance;
 
         vm.prank(creator);
-        split.distributeEth();
+        split.distributeNative();
 
         uint256 fee = (10000 * 50) / 10000; // 0.5%
         uint256 distributable = 10000 - fee;
@@ -109,54 +106,46 @@ contract SplitContractTest is Test {
         assertEq(treasury.balance, initialTreasuryBalance + fee);
         assertEq(recipient1.balance, initialRecipient1Balance + amountEach);
         assertEq(recipient2.balance, initialRecipient2Balance + amountEach);
-        assertEq(split.ethDistributed(), distributable);
+        assertEq(split.nativeDistributed(), distributable);
     }
 
-    function testDistributeEthNoBalance() public {
+    function testDistributeNativeNoBalance() public {
         vm.prank(creator);
-        vm.expectRevert("No ETH to distribute");
-        split.distributeEth();
+        vm.expectRevert(SplitContract.NoNativeToDistribute.selector);
+        split.distributeNative();
     }
 
-    function testDistributeEthNotCreator() public {
+    function testDistributeNativeNotCreator() public {
         vm.deal(address(split), 10000);
-        vm.expectRevert(SplitContract.invalid_caller.selector);
-        split.distributeEth();
+        vm.expectRevert(SplitContract.InvalidCaller.selector);
+        split.distributeNative();
     }
 
-    function testDistributeEthFinalized() public {
+    function testDistributeNativeFinalized() public {
         vm.prank(creator);
         split.finalize();
         vm.deal(address(split), 10000);
         vm.prank(creator);
-        vm.expectRevert(SplitContract.split_NotFinalized.selector);
-        split.distributeEth();
+        vm.expectRevert(SplitContract.SplitAlreadyFinalized.selector);
+        split.distributeNative();
     }
 
     // Test depositToken
     function testDepositToken() public {
         token.transfer(address(this), 1000);
         token.approve(address(split), 1000);
-        split.depositToken(1000);
+        split.depositToken(address(token), 1000);
         assertEq(token.balanceOf(address(split)), 1000);
     }
 
     function testDepositTokenZeroAmount() public {
-        vm.expectRevert("Amount must be greater than zero");
-        split.depositToken(0);
+        vm.expectRevert(SplitContract.AmountMustBeGreaterThanZero.selector);
+        split.depositToken(address(token), 0);
     }
 
-    function testDepositTokenNoTokenSet() public {
-        vm.prank(creator);
-        SplitContract ethSplit = new SplitContract(
-            recipients,
-            percentages,
-            creator,
-            treasury,
-            address(0)
-        );
-        vm.expectRevert("No token set for this split");
-        ethSplit.depositToken(100);
+    function testDepositTokenInvalidToken() public {
+        vm.expectRevert(SplitContract.InvalidTokenAddress.selector);
+        split.depositToken(address(0), 100);
     }
 
     // Test distributeToken
@@ -167,7 +156,7 @@ contract SplitContractTest is Test {
         uint256 initialRecipient2Balance = token.balanceOf(recipient2);
 
         vm.prank(creator);
-        split.distributeToken();
+        split.distributeToken(address(token));
 
         uint256 fee = (10000 * 50) / 10000;
         uint256 distributable = 10000 - fee;
@@ -187,8 +176,8 @@ contract SplitContractTest is Test {
 
     function testDistributeTokenNoBalance() public {
         vm.prank(creator);
-        vm.expectRevert("No token to distribute");
-        split.distributeToken();
+        vm.expectRevert(SplitContract.NoTokenToDistribute.selector);
+        split.distributeToken(address(token));
     }
 
     // Test finalize
@@ -199,7 +188,7 @@ contract SplitContractTest is Test {
     }
 
     function testFinalizeNotCreator() public {
-        vm.expectRevert(SplitContract.invalid_caller.selector);
+        vm.expectRevert(SplitContract.InvalidCaller.selector);
         split.finalize();
     }
 
@@ -231,7 +220,7 @@ contract SplitContractTest is Test {
     }
 
     function testWithdrawRemainingNotFinalized() public {
-        vm.expectRevert("Split not finalized");
+        vm.expectRevert(SplitContract.SplitNotFinalized.selector);
         vm.prank(creator);
         split.withdrawRemaining(address(0));
     }
@@ -240,18 +229,19 @@ contract SplitContractTest is Test {
     function testGetDetails() public {
         (
             address treas,
-            address tok,
             address[] memory recs,
             uint256[] memory perc,
-            uint256 ethDist,
+            uint256 nativeDist,
             uint256 tokDist,
-            bool fin
+            bool fin,
+            uint256 created,
+            uint256 fees,
+            uint256 chain
         ) = split.getDetails();
         assertEq(treas, treasury);
-        assertEq(tok, address(token));
         assertEq(recs.length, 2);
         assertEq(perc.length, 2);
-        assertEq(ethDist, 0);
+        assertEq(nativeDist, 0);
         assertEq(tokDist, 0);
         assertFalse(fin);
     }
@@ -260,11 +250,12 @@ contract SplitContractTest is Test {
         assertEq(split.getRecipientCount(), 2);
     }
 
-    function testGetBalances() public {
+    function testGetBalance() public {
         vm.deal(address(split), 500);
         token.transfer(address(split), 1000);
-        (uint256 ethBal, uint256 tokBal) = split.getBalances();
-        assertEq(ethBal, 500);
+        uint256 nativeBal = split.getBalance(address(0));
+        uint256 tokBal = split.getBalance(address(token));
+        assertEq(nativeBal, 500);
         assertEq(tokBal, 1000);
     }
 }
@@ -293,7 +284,6 @@ contract SplitFactoryTest is Test {
     function testCreateSplit() public {
         vm.prank(creator);
         address splitAddr = factory.createSplit(
-            address(token),
             recipients,
             percentages
         );
@@ -309,8 +299,8 @@ contract SplitFactoryTest is Test {
         invalidPerc[0] = 3000;
         invalidPerc[1] = 3000; // sum != 10000
         vm.prank(creator);
-        vm.expectRevert("Percentages must sum to 10000");
-        factory.createSplit(address(token), recipients, invalidPerc);
+        vm.expectRevert(SplitFactory.PercentageSumInvalid.selector);
+        factory.createSplit(recipients, invalidPerc);
     }
 
     function testCreateSplitZeroPercentage() public {
@@ -318,8 +308,8 @@ contract SplitFactoryTest is Test {
         zeroPerc[0] = 0;
         zeroPerc[1] = 10000;
         vm.prank(creator);
-        vm.expectRevert("Percentage must be greater than 0");
-        factory.createSplit(address(token), recipients, zeroPerc);
+        vm.expectRevert(SplitFactory.InvalidPercentage.selector);
+        factory.createSplit(recipients, zeroPerc);
     }
 
     // Test emergencyWithdraw
@@ -356,7 +346,6 @@ contract SplitFactoryTest is Test {
     function testGetUserSplits() public {
         vm.prank(creator);
         address splitAddr = factory.createSplit(
-            address(token),
             recipients,
             percentages
         );
@@ -369,7 +358,6 @@ contract SplitFactoryTest is Test {
     function testGetAllSplits() public {
         vm.prank(creator);
         address splitAddr = factory.createSplit(
-            address(token),
             recipients,
             percentages
         );

@@ -1,67 +1,74 @@
 // SPDX-License-Identifier: MIT
-pragma solidity ^0.8.24;
+pragma solidity 0.8.30;
+
 import "@openzeppelin/contracts/access/Ownable.sol";
 import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 
+/**
+ * @title SplitContract
+ * @notice Multi-chain payment splitting contract for Base and Celo
+ * @dev Supports native tokens (ETH/CELO) and stablecoins (USDC, cUSD)
+ */
 contract SplitContract is ReentrancyGuard {
     using SafeERC20 for IERC20;
 
-    event ETHReceived(address indexed from, uint256 amount);
-    event ETHDistributed(uint256 totalAmount);
-    event TokenReceived(
-        address indexed token,
-        address indexed from,
-        uint256 amount
-    );
-    event TokenDistributed(address indexed token, uint256 totalAmount);
-    event RecipientPaid(
-        address indexed recipient,
-        address indexed token,
-        uint256 amount
-    );
-    event RecipientPaymentFailed(
-        address indexed recipient,
-        address indexed token,
-        uint256 amount
-    );
+    // Events
+    event NativeReceived(address indexed from, uint256 amount);
+    event NativeDistributed(uint256 totalAmount, uint256 feeCollected);
+    event TokenReceived(address indexed token, address indexed from, uint256 amount);
+    event TokenDistributed(address indexed token, uint256 totalAmount, uint256 feeCollected);
+    event RecipientPaid(address indexed recipient, address indexed token, uint256 amount);
+    event RecipientPaymentFailed(address indexed recipient, address indexed token, uint256 amount);
     event SplitFinalized(uint256 timestamp);
     event DustSentToTreasury(address indexed token, uint256 amount);
+    event SplitMetadataUpdated(string metadata);
 
+    // Constants
     uint256 public constant BASIS_POINTS_SCALE = 10000;
     uint256 public constant FEE_BASIS_POINTS = 50; // 0.5% fee
+    uint256 public constant MAX_RECIPIENTS = 100;
 
-    address public splitCreator;
-    address public treasury;
-    address public token; // ERC20 token address (address(0) for ETH-only)
+    // State variables
+    address public immutable splitCreator;
+    address public immutable treasury;
+    address public immutable token; // ERC20 token address (address(0) for native token)
+    uint256 public immutable chainId; // Chain ID for multi-chain tracking
+    uint256 public immutable createdAt;
+    
     address[] public recipients;
-    uint256[] public percentages; // in base points
+    uint256[] public percentages;
+    string public metadata; // JSON metadata
 
-    uint256 public ethDistributed;
+    uint256 public nativeDistributed;
     uint256 public tokenDistributed;
+    uint256 public totalFeesCollected;
     bool public finalized;
 
-    error invalid_caller();
-    error split_NotFinalized();
-    error no_Token_to_Distribute();
-    error invalid_split_creator();
-    error no_Eth_To_Distribute();
-    error Amount_must_be_greater_Zero();
-    error recipient_must_be_greater_than_Zero();
-    error recipient_and_Percentage_length_not_the_same();
+    // Custom errors
+    error InvalidCaller();
+    error SplitAlreadyFinalized();
+    error NoTokenToDistribute();
+    error InvalidSplitCreator();
+    error NoNativeToDistribute();
+    error AmountMustBeGreaterThanZero();
+    error RecipientCountExceedsLimit();
+    error InvalidRecipientAddress();
+    error InvalidTreasuryAddress();
+    error InvalidPercentageSum();
+    error TransferFailed();
+    error SplitNotFinalized();
+    error InvalidTokenAddress();
 
+    // Modifiers
     modifier onlySplitCreator() {
-        if (msg.sender != splitCreator) {
-            revert invalid_caller();
-        }
+        if (msg.sender != splitCreator) revert InvalidCaller();
         _;
     }
 
     modifier notFinalized() {
-        if (finalized) {
-            revert split_NotFinalized();
-        }
+        if (finalized) revert SplitAlreadyFinalized();
         _;
     }
 
@@ -71,119 +78,154 @@ contract SplitContract is ReentrancyGuard {
         address _splitCreator,
         address _treasury,
         address _token
-    ){
-        require(_recipients.length > 0, "Must have at least one recipient");
-        require(
-            _recipients.length == _percentages.length,
-            "Recipients and percentages length mismatch"
-        );
-        require(_splitCreator != address(0), "Invalid split creator");
-        require(_treasury != address(0), "Invalid treasury address");
+    ) {
+        if (_recipients.length == 0) revert RecipientCountExceedsLimit();
+        if (_recipients.length > MAX_RECIPIENTS) revert RecipientCountExceedsLimit();
+        if (_recipients.length != _percentages.length) revert InvalidPercentageSum();
+        if (_splitCreator == address(0)) revert InvalidSplitCreator();
+        if (_treasury == address(0)) revert InvalidTreasuryAddress();
+
+        uint256 totalPercentage;
+        uint256 length = _recipients.length;
+        for (uint256 i; i < length;) {
+            if (_percentages[i] == 0) revert InvalidPercentageSum();
+            if (_recipients[i] == address(0)) revert InvalidRecipientAddress();
+            unchecked {
+                totalPercentage += _percentages[i];
+                ++i;
+            }
+        }
+        if (totalPercentage != BASIS_POINTS_SCALE) revert InvalidPercentageSum();
+
         splitCreator = _splitCreator;
         treasury = _treasury;
         token = _token;
         recipients = _recipients;
         percentages = _percentages;
+        createdAt = block.timestamp;
+        chainId = block.chainid;
     }
 
     receive() external payable {
-        require(msg.value > 0, "must send ETH");
-        emit ETHReceived(msg.sender, msg.value);
+        if (msg.value == 0) revert AmountMustBeGreaterThanZero();
+        emit NativeReceived(msg.sender, msg.value);
     }
 
-    function distributeEth()
-        external
-        onlySplitCreator
-        nonReentrant
-        notFinalized
-    {
+    function depositNative(uint256 amount) external payable notFinalized {
+        if (msg.value != amount) revert AmountMustBeGreaterThanZero();
+        emit NativeReceived(msg.sender, amount);
+    }
+
+    function distributeNative() external onlySplitCreator nonReentrant notFinalized {
         uint256 balance = address(this).balance;
-        require(balance > 0, "No ETH to distribute");
+        if (balance == 0) revert NoNativeToDistribute();
 
-        // Calculate fee (0.5% of total balance)
         uint256 fee = (balance * FEE_BASIS_POINTS) / BASIS_POINTS_SCALE;
-        uint256 distributableAmount = balance - fee;
+        uint256 distributableAmount;
+        unchecked {
+            distributableAmount = balance - fee;
+        }
 
-        // Transfer fee to treasury
-        (bool success, ) = payable(treasury).call{value: fee}("");
-        require(success, "Fee transfer to treasury failed");
+        (bool feeSuccess, ) = payable(treasury).call{value: fee}("");
+        if (!feeSuccess) revert TransferFailed();
 
-        uint256 amountDistributed = 0;
-        for (uint256 i = 0; i < recipients.length; i++) {
-            uint256 amount = (distributableAmount * percentages[i]) /
-                BASIS_POINTS_SCALE;
+        uint256 amountDistributed;
+        uint256 length = recipients.length;
+
+        for (uint256 i; i < length;) {
+            uint256 amount = (distributableAmount * percentages[i]) / BASIS_POINTS_SCALE;
             if (amount > 0) {
-                (bool successRecipient, ) = payable(recipients[i]).call{
-                    value: amount
-                }("");
+                (bool successRecipient, ) = payable(recipients[i]).call{value: amount}("");
                 if (successRecipient) {
-                    amountDistributed += amount;
+                    unchecked {
+                        amountDistributed += amount;
+                    }
                     emit RecipientPaid(recipients[i], address(0), amount);
                 } else {
-                    emit RecipientPaymentFailed(
-                        recipients[i],
-                        address(0),
-                        amount
-                    );
+                    emit RecipientPaymentFailed(recipients[i], address(0), amount);
                 }
             }
+            unchecked {
+                ++i;
+            }
         }
-        // Handle dust: send remaining to treasury
-        uint256 remaining = distributableAmount - amountDistributed;
+
+        uint256 remaining;
+        unchecked {
+            remaining = distributableAmount - amountDistributed;
+        }
         if (remaining > 0) {
-            (bool successTreasury, ) = payable(treasury).call{value: remaining}(
-                ""
-            );
-            if (successTreasury) {
+            (bool dustSuccess, ) = payable(treasury).call{value: remaining}("");
+            if (dustSuccess) {
                 emit DustSentToTreasury(address(0), remaining);
             }
         }
-        ethDistributed += amountDistributed;
-        emit ETHDistributed(amountDistributed);
+
+        unchecked {
+            nativeDistributed += amountDistributed;
+            totalFeesCollected += fee;
+        }
+        emit NativeDistributed(amountDistributed, fee);
     }
 
     function depositToken(uint256 amount) external notFinalized {
-        require(token != address(0), "No token set for this split");
-        require(amount > 0, "Amount must be greater than zero");
+        if (token == address(0)) revert InvalidTokenAddress();
+        if (amount == 0) revert AmountMustBeGreaterThanZero();
+        
         IERC20(token).safeTransferFrom(msg.sender, address(this), amount);
         emit TokenReceived(token, msg.sender, amount);
     }
 
-    function distributeToken()
-        external
-        onlySplitCreator
-        nonReentrant
-        notFinalized
-    {
-        require(token != address(0), "No token set for this split");
+    function distributeToken() external onlySplitCreator nonReentrant notFinalized {
+        if (token == address(0)) revert InvalidTokenAddress();
+        
         uint256 balance = IERC20(token).balanceOf(address(this));
-        require(balance > 0, "No token to distribute");
+        if (balance == 0) revert NoTokenToDistribute();
 
-        // Calculate fee (0.5% of total balance)
         uint256 fee = (balance * FEE_BASIS_POINTS) / BASIS_POINTS_SCALE;
-        uint256 distributableAmount = balance - fee;
+        uint256 distributableAmount;
+        unchecked {
+            distributableAmount = balance - fee;
+        }
 
-        // Transfer fee to treasury
         IERC20(token).safeTransfer(treasury, fee);
 
-        uint256 amountDistributed = 0;
-        for (uint256 i = 0; i < recipients.length; i++) {
-            uint256 amount = (distributableAmount * percentages[i]) /
-                BASIS_POINTS_SCALE;
+        uint256 amountDistributed;
+        uint256 length = recipients.length;
+
+        for (uint256 i; i < length;) {
+            uint256 amount = (distributableAmount * percentages[i]) / BASIS_POINTS_SCALE;
             if (amount > 0) {
                 IERC20(token).safeTransfer(recipients[i], amount);
-                amountDistributed += amount;
+                unchecked {
+                    amountDistributed += amount;
+                }
                 emit RecipientPaid(recipients[i], token, amount);
             }
+            unchecked {
+                ++i;
+            }
         }
-        // Handle dust: send remaining to treasury
-        uint256 remaining = distributableAmount - amountDistributed;
+
+        uint256 remaining;
+        unchecked {
+            remaining = distributableAmount - amountDistributed;
+        }
         if (remaining > 0) {
             IERC20(token).safeTransfer(treasury, remaining);
             emit DustSentToTreasury(token, remaining);
         }
-        tokenDistributed += amountDistributed;
-        emit TokenDistributed(token, amountDistributed);
+
+        unchecked {
+            tokenDistributed += amountDistributed;
+            totalFeesCollected += fee;
+        }
+        emit TokenDistributed(token, amountDistributed, fee);
+    }
+
+    function updateMetadata(string memory _metadata) external onlySplitCreator {
+        metadata = _metadata;
+        emit SplitMetadataUpdated(_metadata);
     }
 
     function finalize() external onlySplitCreator {
@@ -192,18 +234,19 @@ contract SplitContract is ReentrancyGuard {
     }
 
     function withdrawRemaining(address tokenAddress) external onlySplitCreator {
-        require(finalized, "Split not finalized");
+        if (!finalized) revert SplitNotFinalized();
+        
         if (tokenAddress == address(0)) {
-            uint256 ethBalance = address(this).balance;
-            require(ethBalance > 0, "No ETH to withdraw");
-            (bool success, ) = payable(splitCreator).call{value: ethBalance}(
-                ""
-            );
-            require(success, "ETH withdrawal failed");
+            uint256 nativeBalance = address(this).balance;
+            if (nativeBalance == 0) revert NoNativeToDistribute();
+            
+            (bool success, ) = payable(splitCreator).call{value: nativeBalance}("");
+            if (!success) revert TransferFailed();
         } else {
-            require(tokenAddress == token, "Invalid token address");
+            if (tokenAddress != token) revert InvalidTokenAddress();
             uint256 tokenBalance = IERC20(token).balanceOf(address(this));
-            require(tokenBalance > 0, "No tokens to withdraw");
+            if (tokenBalance == 0) revert NoTokenToDistribute();
+            
             IERC20(token).safeTransfer(splitCreator, tokenBalance);
         }
     }
@@ -212,13 +255,16 @@ contract SplitContract is ReentrancyGuard {
         external
         view
         returns (
-            address,
-            address,
-            address[] memory,
-            uint256[] memory,
-            uint256,
-            uint256,
-            bool
+            address _treasury,
+            address _token,
+            address[] memory _recipients,
+            uint256[] memory _percentages,
+            uint256 _nativeDistributed,
+            uint256 _tokenDistributed,
+            bool _finalized,
+            uint256 _createdAt,
+            uint256 _totalFees,
+            uint256 _chainId
         )
     {
         return (
@@ -226,9 +272,12 @@ contract SplitContract is ReentrancyGuard {
             token,
             recipients,
             percentages,
-            ethDistributed,
+            nativeDistributed,
             tokenDistributed,
-            finalized
+            finalized,
+            createdAt,
+            totalFeesCollected,
+            chainId
         );
     }
 
@@ -239,110 +288,103 @@ contract SplitContract is ReentrancyGuard {
     function getBalances()
         external
         view
-        returns (uint256 ethAmount, uint256 tokenAmount)
+        returns (uint256 nativeAmount, uint256 tokenAmount)
     {
-        ethAmount = address(this).balance;
-        tokenAmount = token == address(0)
-            ? 0
-            : IERC20(token).balanceOf(address(this));
+        nativeAmount = address(this).balance;
+        tokenAmount = token == address(0) ? 0 : IERC20(token).balanceOf(address(this));
     }
 
-    function depositEth(uint256 amount) external payable onlySplitCreator notFinalized {
-        require(amount > 0, "Amount must be greater than zero");
-        require(msg.value == amount, "Sent ETH must match the specified amount");
-        emit ETHReceived(msg.sender, amount);
-    }
 }
 
+/**
+ * @title SplitFactory
+ * @notice Multi-chain factory for Base and Celo deployments
+ */
 contract SplitFactory is Ownable(msg.sender), ReentrancyGuard {
-    address[] public splits;
-    mapping(address => address[]) public userSplits; // creator => splits
-    mapping(address => bool) public isSplit; // quick lookup
+    using SafeERC20 for IERC20;
 
-    // Events
+    address[] public splits;
+    mapping(address => bool) public isSplit;
+
+    uint256 public totalSplitsCreated;
+    uint256 public immutable CHAIN_ID;
+
     event SplitCreated(
         address indexed splitAddress,
         address indexed creator,
         address token,
         address[] recipients,
         uint256[] percentages,
-        uint256 timestamp
+        uint256 timestamp,
+        uint256 chainId
     );
+
+    error InvalidRecipientCount();
+    error LengthMismatch();
+    error InvalidPercentage();
+    error PercentageSumInvalid();
+
+    constructor() {
+        CHAIN_ID = block.chainid;
+    }
 
     function createSplit(
         address token,
         address[] memory recipients,
         uint256[] memory percentages
     ) external nonReentrant returns (address) {
-        require(recipients.length > 0, "Must have at least one recipient");
-        require(
-            recipients.length == percentages.length,
-            "Recipients and percentages length must match"
-        );
+        if (recipients.length == 0) revert InvalidRecipientCount();
+        if (recipients.length != percentages.length) revert LengthMismatch();
 
-        // Verify percentage sum to 10000
-        uint256 totalPercentage = 0;
-        for (uint256 i = 0; i < percentages.length; i++) {
-            require(percentages[i] > 0, "Percentage must be greater than 0");
-            totalPercentage += percentages[i];
+        uint256 totalPercentage;
+        uint256 length = recipients.length;
+        for (uint256 i; i < length;) {
+            if (percentages[i] == 0) revert InvalidPercentage();
+            unchecked {
+                totalPercentage += percentages[i];
+                ++i;
+            }
         }
-        require(totalPercentage == 10000, "Percentages must sum to 10000");
+        if (totalPercentage != 10000) revert PercentageSumInvalid();
 
-        // Create new split contract
         SplitContract newSplit = new SplitContract(
             recipients,
             percentages,
             msg.sender,
-            owner(), // treasury is the factory owner
+            owner(),
             token
         );
+        
         address splitAddress = address(newSplit);
         splits.push(splitAddress);
-        userSplits[msg.sender].push(splitAddress);
         isSplit[splitAddress] = true;
+        unchecked {
+            ++totalSplitsCreated;
+        }
+
         emit SplitCreated(
             splitAddress,
             msg.sender,
             token,
             recipients,
             percentages,
-            block.timestamp
+            block.timestamp,
+            CHAIN_ID
         );
+
         return splitAddress;
     }
 
-    function emergencyWithdraw(
-        address token,
-        uint256 amount
-    ) external onlyOwner nonReentrant {
-        if (token == address(0)) {
-            require(
-                amount <= address(this).balance,
-                "Insufficient ETH balance"
-            );
-            (bool success, ) = payable(owner()).call{value: amount}("");
-            require(success, "ETH transfer failed");
-        } else {
-            require(
-                amount <= IERC20(token).balanceOf(address(this)),
-                "Insufficient token balance"
-            );
-            IERC20(token).transfer(owner(), amount);
-        }
-    }
 
     function getSplitCount() external view returns (uint256) {
         return splits.length;
     }
 
-    function getUserSplits(
-        address user
-    ) external view returns (address[] memory) {
-        return userSplits[user];
-    }
 
-    function getAllSplits() external view returns (address[] memory) {
-        return splits;
+
+
+    function isValidSplit(address splitAddress) external view returns (bool) {
+        return isSplit[splitAddress];
     }
 
     receive() external payable {}
