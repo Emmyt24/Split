@@ -5,11 +5,7 @@ libs = ["lib"]
 remappings = ["@openzeppelin/=lib/openzeppelin-contracts/"]
 
 # Base Networks
-[rpc_endpoints]
-base = "https://base-mainnet.g.alchemy.com/v2/Z8ps3lEeb_j7VOniV_nSVx4o1940CLWl"
-base-sepolia = "https://base-sepolia.g.alchemy.com/v2/Z8ps3lEeb_j7VOniV_nSVx4o1940CLWlto"
-celo-sepolia = "https://celo-sepolia.g.alchemy.com/v2/Z8ps3lEeb_j7VOniV_nSVx4o1940CLWl"
-celo = "https://celo-mainnet.g.alchemy.com/v2/Z8ps3lEeb_j7VOniV_nSVx4o1940CLWl"
+
 
 
 # See more config options https://github.com/foundry-rs/foundry/blob/master/crates/config/README.md#all-options
